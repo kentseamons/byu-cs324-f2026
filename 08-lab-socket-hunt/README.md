@@ -1001,15 +1001,15 @@ The following hostnames correspond to the servers where the games might be
 initiated.  In all cases the port is 32400.
 
  - arizona
- - alaska
- - carolina
  - california
- - idaho
  - hawaii
  - michigan
  - indiana
  - rhodeisland
  - oregon
+ - rome
+ - sanfrancisco
+ - seattle
  - tennessee
  - wyoming
 
