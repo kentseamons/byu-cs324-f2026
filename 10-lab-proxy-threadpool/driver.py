@@ -1,5 +1,4 @@
 #!/usr/bin/python3
-#
 
 import argparse
 import logging
@@ -11,6 +10,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import signal
 
 class PortWaitTimeout(Exception):
     pass
@@ -78,11 +78,12 @@ class ProxyTestSuite:
                         server_output=self.server_output,
                         proxy_output=self.proxy_output,
                         verbose=self.verbose)
-                print('    %s' % (p.DESCRIPTION))
-                print('      %s' % (p.EXTENDED_DESCRIPTION))
-
-                p.run()
-                p.cleanup()
+                try:
+                    print('    %s' % (p.DESCRIPTION))
+                    print('      %s' % (p.EXTENDED_DESCRIPTION))
+                    p.run()
+                finally:
+                    p.cleanup()
                 attempts += p.attempts
                 successes += p.successes
                 possible_mem_mgmt += 1
@@ -210,17 +211,19 @@ class ProxyTest:
 
         self.cleanup_processes_non_targetted()
         self._check_files()
+        try:
+            self.start_server()
+            self.start_proxy()
+            # Wait for threads to be initialized
+            time.sleep(1)
 
-        self.start_server()
-        self.start_proxy()
+            self.proxy_pid = self.get_proxy_pid()
 
-        # Wait for threads to be initialized
-        time.sleep(1)
-
-        self.proxy_pid = self.get_proxy_pid()
-
-        self.num_threads_pre = self.get_num_threads(self.proxy_pid)
-        self.num_processes_pre = self.get_num_processes(self.proxy_pid)
+            self.num_threads_pre = self.get_num_threads(self.proxy_pid)
+            self.num_processes_pre = self.get_num_processes(self.proxy_pid)
+        except:
+            self.cleanup_processes()
+            raise
 
     def __del__(self):
         self.cleanup_processes()
@@ -353,28 +356,49 @@ class ProxyTest:
         except subprocess.CalledProcessError as e:
             pass
 
+    def _group_exists(self, proc):
+        try:
+            os.killpg(proc.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
     def _cleanup_processes(self, kill_proxy, kill_server, kill_nop):
-        for sig in ('INT', 'TERM'):
-            pids = []
-            if kill_proxy and self.proxy_proc is not None and self.proxy_proc.poll() is None:
-                pids.append(self.proxy_proc.pid)
-            if kill_server and self.server_proc is not None and self.server_proc.poll() is None:
-                pids.append(self.server_proc.pid)
-            if kill_nop and self.nop_server_proc is not None and self.nop_server_proc.poll() is None:
-                pids.append(self.nop_server_proc.pid)
+        kill_groups = []
 
-            if not pids:
-                break
+        if kill_proxy and self.proxy_proc is not None:
+            kill_groups.append(self.proxy_proc)
+        if kill_server and self.server_proc is not None:
+            kill_groups.append(self.server_proc)
+        if kill_nop and self.nop_server_proc is not None:
+            kill_groups.append(self.nop_server_proc)
 
-            cmd = ['kill', '-%s' % (sig)] + [str(p) for p in pids]
-            self.logger.debug(' '.join(cmd))
+        # Ask every target to exit before waiting for any of them.
+        for proc in kill_groups:
             try:
-                subprocess.call(['kill', '-%s' % (sig)] + [str(p) for p in pids],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-            except subprocess.CalledProcessError as e:
+                os.killpg(proc.pid, signal.SIGINT)
+            except ProcessLookupError:
                 pass
 
-            time.sleep(1)
+        # Allow up to two seconds total for all targets.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            groups_alive = any(self._group_exists(proc) for proc in kill_groups)
+            if not groups_alive:
+                break
+            time.sleep(0.05)
+
+        # Terminate anything still running.
+        for proc in kill_groups:
+            if self._group_exists(proc):
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+        # Reap the Popen processes.
+        for proc in kill_groups:
+            proc.wait()
 
     def cleanup_processes(self):
         self.logger.info('Cleaning up all processes.')
@@ -489,7 +513,7 @@ class ProxyTest:
         else:
             kwargs.update(stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         self.logger.debug(' '.join(cmd))
-        self.server_proc = subprocess.Popen(cmd, cwd=WWW_DIR, **kwargs)
+        self.server_proc = subprocess.Popen(cmd, start_new_session=True, cwd=WWW_DIR, **kwargs)
         self.wait_for_port_use(self.server_port, 5)
 
     def start_proxy(self):
@@ -506,7 +530,7 @@ class ProxyTest:
         else:
             kwargs.update(stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         self.logger.debug(' '.join(cmd))
-        self.proxy_proc = subprocess.Popen(cmd, **kwargs)
+        self.proxy_proc = subprocess.Popen(cmd,start_new_session=True, **kwargs)
         self.wait_for_port_use(self.proxy_port, 5)
 
     def start_nop_server(self):
@@ -516,7 +540,7 @@ class ProxyTest:
         if not self.verbose:
             kwargs.update(stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         self.logger.debug(' '.join(cmd))
-        self.nop_server_proc = subprocess.Popen(cmd, **kwargs)
+        self.nop_server_proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
         self.wait_for_port_use(self.nop_server_port, 5)
 
     def _filesystem_safe(self, s):
